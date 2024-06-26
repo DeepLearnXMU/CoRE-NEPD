@@ -369,8 +369,8 @@ class Trainer:
         self.epochs_trained = 0
         self.steps_trained_in_current_epoch = 0
         self.intro_train_step = 1
-
-        relations = json.load(open('/home/sata/yuehao/ecrim/data/rawdata/relations.json'))
+        ##this may cause an error, you should use the absolute path
+        relations = json.load(open('../data/rawdata/relations.json'))
         relations.sort()
         self.relations = ['n/a'] + relations
         self.relation2id = dict()
@@ -519,7 +519,7 @@ class Trainer:
         model.zero_grad()
         A = model(*tmp[0])
 
-        ##pooled_output -> last layer hiddenstates[0] 过线性层 -> 激活函数
+        ##pooled_output -> last layer hiddenstates[0]
         pooled_output = A[1]
 
 
@@ -546,10 +546,10 @@ class Trainer:
             saliency_grad_tmp = np.sum(saliency_grad_data * embeddings_list[0][index], axis=1)
             # print("saliency_grad_tmp.shape")
             # print(saliency_grad_tmp.shape)
-            ###范数，ord = 1, 绝对值 
+            ###ord = 1
             norm = np.linalg.norm(saliency_grad_tmp, ord=1)
 
-            ###归一化
+            
             saliency_grads = [e / norm for e in saliency_grad_tmp] 
 
             saliency_grad_final.append(saliency_grads)
