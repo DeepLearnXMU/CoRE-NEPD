@@ -10,7 +10,7 @@ import sklearn
 import torch
 # print(torch.__version__)
 from eveliver import (Logger, load_model, tensor_to_obj)
-from trainer import Trainer, TrainerCallback
+from trainer_enhance import Trainer, TrainerCallback
 from transformers import AutoTokenizer, BertModel, AutoModel
 from matrix_transformer import Encoder as MatTransformer
 from graph_encoder import Encoder as GraphEncoder
@@ -1802,6 +1802,10 @@ class Codred(torch.nn.Module):
 
             attention = bert_outputs[-1][-1]
 
+            with torch.no_grad():
+                ner_embedding, _ = self.sen_bert(input_ids, attention_mask=attention_mask,
+                                                    token_type_ids=token_type_ids,
+                                                    return_dict=False)
             
             if rs is not None or not train:
                 entity_mask, entity_span_list = self.get_htb(input_ids)
@@ -1859,13 +1863,13 @@ class Codred(torch.nn.Module):
                     
                     
                 
-                tmp_b_embs, tmp_b_keys, _, tmp_b_ner_embs = self.get_bag_en_embs(bag_b_span_chunks, input_ids, embedding, bag_len, embedding)
+                tmp_b_embs, tmp_b_keys, _, tmp_b_ner_embs = self.get_bag_en_embs(bag_b_span_chunks, input_ids, embedding, bag_len, ner_embedding)
                 
                 tmp_unb_embs, tmp_unb_keys, tmp_unb_docs, tmp_unb_ner_embs = self.get_bag_en_embs(bag_unb_span_chunks,
                                                                                                   input_ids,
                                                                                                   embedding,
                                                                                                   bag_len,
-                                                                                                  embedding,
+                                                                                                  ner_embedding,
                                                                                                   bag_sen_spans,
                                                                                                   bag_sen_docs)
 
@@ -2187,14 +2191,14 @@ class Codred(torch.nn.Module):
                     # print("tmp_embedding",tmp_embedding.shape)
                     tmp_b_embs, tmp_b_keys, _, tmp_b_ner_embs = self.get_bag_en_embs(bag_b_span_chunks, input_ids,
                                                                                      tmp_embedding, bag_len,
-                                                                                     embedding)
+                                                                                     ner_embedding)
 
                     tmp_unb_embs, tmp_unb_keys, tmp_unb_docs, tmp_unb_ner_embs = self.get_bag_en_embs(
                         bag_unb_span_chunks,
                         input_ids,
                         tmp_embedding,
                         bag_len,
-                        embedding,
+                        ner_embedding,
                         bag_sen_spans,
                         bag_sen_docs)
 
