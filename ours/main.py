@@ -10,7 +10,7 @@ import sklearn
 import torch
 # print(torch.__version__)
 from eveliver import (Logger, load_model, tensor_to_obj)
-from trainer_enhance import Trainer, TrainerCallback
+from trainer import Trainer, TrainerCallback
 from transformers import AutoTokenizer, BertModel, AutoModel
 from matrix_transformer import Encoder as MatTransformer
 from graph_encoder import Encoder as GraphEncoder
@@ -2657,6 +2657,7 @@ class CodredCallback(TrainerCallback):
         parser.add_argument('--model_name', type=str, default='bert')
 
     def load_model(self):
+        ##this may cause an error, you should use the absolute path
         relations = json.load(open('../data/rawdata/relations.json'))
         relations.sort()
         self.relations = ['n/a'] + relations
@@ -2831,9 +2832,9 @@ class CodredCallback(TrainerCallback):
         #stat_enhance_label = eval_performance(facts, pred_result_enhance_label)                
         
         with self.trainer.once():
-            json.dump(stat, open(f'output/dev-stat-dual-K1-{epoch}.json', 'w'))
+            #json.dump(stat, open(f'output/dev-stat-dual-K1-{epoch}.json', 'w'))
             json.dump(stat_enhance, open(f'output/dev-enhance_0.1_sub0.1-{epoch}.json', 'w'))
-            json.dump(results, open(f'output/dev-results-dual-K1-{epoch}.json', 'w'))
+            #json.dump(results, open(f'output/dev-results-dual-K1-{epoch}.json', 'w'))
         return stat['f1']
 
     def on_test_epoch_start(self, epoch):
@@ -2918,7 +2919,7 @@ class CodredCallback(TrainerCallback):
         enhance_01_coda_file['predictions'] = enhance_01_results
         with self.trainer.once():
             json.dump(enhance_01_coda_file, open(f'output/test-enhance-results-{epoch}.json', 'w'))
-            json.dump(org_coda_file, open(f'output/test-orgcodalab-results-{epoch}.json', 'w'))
+            #json.dump(org_coda_file, open(f'output/test-orgcodalab-results-{epoch}.json', 'w'))
         return True
     def process_train_data(self, data):
         # selected_rets = []
