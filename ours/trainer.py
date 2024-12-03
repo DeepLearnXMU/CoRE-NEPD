@@ -460,9 +460,9 @@ class Trainer:
                     pre_dict["predictor_balanced."+tmpkey] = value
         else:
             pre_dict = torch.load(os.path.join(path, 'pytorch_model.bin'), map_location=self.device)
-        # for key,value in self.model.predictor_balanced.state_dict().items():
-        #     # print(key)
-        #     pre_dict["predictor_balanced."+key] = value
+            for key,value in self.model.predictor_balanced.state_dict().items():
+                # print(key)
+                pre_dict["predictor_balanced."+key] = value
         model_to_load.load_state_dict(pre_dict)
         if self.train:
             self.optimizer.load_state_dict(torch.load(os.path.join(path, "optimizer.pt"), map_location=self.device))
