@@ -16,11 +16,16 @@ Follow the guideliens from : https://github.com/thunlp/CodRED
 ## Dataset
 All of the dataset files are in ```./dataset/```
 
-please add [dsre_train_example.json] (https://drive.google.com/file/d/1_E0V6ljMu-J6s3O7AUmdRdxhKBFTlJBv/view?usp=sharing) to ```./dataset/```
+please add dsre_train_example.json to ```./dataset/```
 
 Note that we also provide the dataset for open setting in ```./dataset/open_setting_data/```, following https://github.com/luka-group/MrCoD
 
 For data preparation and processing steps, please refer to https://github.com/thunlp/CodRED
+
+| dataset       | Link                                         |
+| ----------- | -------------------------------------------- |
+| dsre_train_example.json  | [Download](https://drive.google.com/file/d/1_E0V6ljMu-J6s3O7AUmdRdxhKBFTlJBv/view?usp=sharing) |
+
 ## Saved Models
 We also provide checkpoints for convenient.
 | Model       | Link                                         |
