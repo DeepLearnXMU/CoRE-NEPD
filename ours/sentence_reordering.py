@@ -1,363 +1,567 @@
 import torch
-from copy import copy
-from transformers import AutoTokenizer
-from utils import CAPACITY, BLOCK_SIZE, DEFAULT_MODEL_NAME
-import random
-from bisect import bisect_left
-from itertools import chain
+import torch.nn.functional as F
+from transformers import AutoTokenizer, BertModel
 import pdb
+from tqdm import tqdm
+from itertools import groupby
+from topological_sort import Graph
+import random
+import numpy as np
+# def get_path_embeddings(sens, model, tokenizer, args):
+#     # -----------------------------------------------
+# 
+# 
+#     # -----------------------------------------------
+#     # Set seed
+# 
+#     # Set up logger
+#     #logging.basicConfig(format="%(asctime)s : %(message)s", level=logging.DEBUG)
+# 
+#     # -----------------------------------------------
+#     # Set Model
+# 
+# 
+#     # -----------------------------------------------
+# 
+#     # sentence1 = input("\nEnter the first sentence: ")
+#     # sentence2 = input("Enter the second sentence: ")
+# 
+#     sentences = sens
+# 
+#     #print("The two sentences we have are:", len(sentences),sentences)
+# 
+# 
+#     # -----------------------------------------------
+#     sentences_index = [tokenizer.encode(s, max_length=128,add_special_tokens=True) for s in sentences]
+#     #sentences_index = tokenizer.batch_encode_plus(sens, add_special_tokens=True, pad_to_max_length=True, max_length=128, return_tensors='pt')
+#     # print(sentences_index['input_ids'].size())
+#     # print(sentences_index['attention_mask'].size())
+#     #inputs = {"input_ids": sentences_index['input_ids'].to(device), "attention_mask": sentences_index['attention_mask'].to(device)}
+#     # print(sens)
+#     # print(sentences_index)
+# 
+#     #
+#     features_input_ids = []
+#     features_mask = []
+#     for sent_ids in sentences_index:
+#         # Truncate if too long
+#         if len(sent_ids) > params["max_seq_length"]:
+#             sent_ids = sent_ids[: params["max_seq_length"]]
+#         sent_mask = [1] * len(sent_ids)
+#         # Padding
+#         padding_length = params["max_seq_length"] - len(sent_ids)
+#         sent_ids += [0] * padding_length
+#         sent_mask += [0] * padding_length
+#         # Length Check
+#         assert len(sent_ids) == params["max_seq_length"]
+#         assert len(sent_mask) == params["max_seq_length"]
+# 
+#         features_input_ids.append(sent_ids)
+#         features_mask.append(sent_mask)
+#     #
+#     #features_mask = sentences_index['attention_mask'].numpy()
+#     features_mask = np.array(features_mask)
+#     #
+#     batch_input_ids = torch.tensor(features_input_ids, dtype=torch.long)
+#     batch_input_mask = torch.tensor(features_mask, dtype=torch.long)
+#     batch = [batch_input_ids.to(device), batch_input_mask.to(device)]
+# 
+#     inputs = {"input_ids": batch[0], "attention_mask": batch[1]}
+# 
+#     #print(inputs['input_ids'].size())
+#     model.zero_grad()
+# 
+#     with torch.no_grad():
+#         #features = model(**inputs)[1]
+#         features = model(**inputs)[1]
+# 
+#     # Reshape features from list of (batch_size, seq_len, hidden_dim) for each hidden state to list
+#     # of (num_hidden_states, seq_len, hidden_dim) for each element in the batch.
+#     all_layer_embedding = torch.stack(features).permute(1, 0, 2, 3).cpu().numpy()
+#     #
+#     embed_method = utils.generate_embedding(params["embed_method"], features_mask)
+#     embedding = embed_method.embed(params, all_layer_embedding)
+#     #embedding = None
+#     return embedding
 
-class Block:
-    """Similar to CogLTX(https://proceedings.neurips.cc/paper/2020/file/96671501524948bc3937b4b30d0e57b9-Paper.pdf).
-    """
-    tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_NAME)
-    def __init__(self, ids, pos, blk_type=1, **kwargs):
-        self.ids = ids
-        self.pos = pos
-        self.blk_type = blk_type
-        self.relevance = 0
-        self.estimation = 0
-        self.entail_score = 0
-        self.docid = 0
-        self.h_flag = 0
-        self.t_flag = 0
-        self.__dict__.update(kwargs)
-    def __lt__(self, rhs):
-        return self.blk_type < rhs.blk_type or (self.blk_type == rhs.blk_type and self.pos < rhs.pos)
-    def __ne__(self, rhs):
-        return self.pos != rhs.pos or self.blk_type != rhs.blk_type
-    def __len__(self):
-        return len(self.ids)
-    def __str__(self):
-        return Block.tokenizer.convert_tokens_to_string(Block.tokenizer.convert_ids_to_tokens(self.ids))
 
-class Buffer:
-    @staticmethod
-    def split_document_into_blocks(d, tokenizer, cnt=0, hard=True, properties=None, docid=0):
-        ret = Buffer()
-        updiv = lambda a,b: (a - 1) // b + 1
-        if hard:
-            for sid, tsen in enumerate(d):
-                psen = properties[sid] if properties is not None else []
-                num = updiv(len(tsen), BLOCK_SIZE) # cls
-                bsize = updiv(len(tsen), num)
-                for i in range(num):
-                    st, en = i * bsize, min((i + 1) * bsize, len(tsen))
-                    cnt += 1
-                    tmp = tsen[st: en] + [tokenizer.sep_token]
-                    # inject properties into blks
-                    tmp_kwargs = {}
-                    for p in psen:
-                        if len(p) == 2:
-                            tmp_kwargs[p[0]] = p[1]
-                        elif len(p) == 3:
-                            if st <= p[1] < en:
-                                tmp_kwargs[p[0]] = (p[1] - st, p[2])
-                        else:
-                            raise ValueError('Invalid property {}'.format(p))
-                    ret.insert(Block(tokenizer.convert_tokens_to_ids(tmp), cnt, **tmp_kwargs))
-        else:
-            # d is only a list of tokens, not split. 
-            # properties are also a list of tuples.
-            end_tokens = {'\n':0, '.':1, '?':1, '!':1, ',':2}
-            for k, v in list(end_tokens.items()):
-                end_tokens['Ġ' + k] = v
-            sen_cost, break_cost = 4, 8
-            poses = [(i, end_tokens[tok]) for i, tok in enumerate(d) if tok in end_tokens]
-            poses.insert(0, (-1, 0))
-            if poses[-1][0] < len(d) - 1:
-                poses.append((len(d) - 1, 0))
-            x = 0
-            while x < len(poses) - 1:
-                if poses[x + 1][0] - poses[x][0] > BLOCK_SIZE:
-                    poses.insert(x + 1, (poses[x][0] + BLOCK_SIZE, break_cost))
-                x += 1
 
-            best = [(0, 0)]
-            for i, (p, cost) in enumerate(poses):
-                if i == 0:
+class SentReOrdering():
+    def __init__(self, doc1_sentences, doc2_sentences, encoder, device, tokenizer, h, t, sbert_wk):
+        self.encoder = encoder
+        self.doc1_sentences = doc1_sentences
+        self.doc2_sentences = doc2_sentences
+        self.device = device
+        self.max_len = 512
+        self.tokenizer = tokenizer
+        self.h = h
+        self.t = t
+        self.sentences = self.doc1_sentences + self.doc2_sentences
+        self.sbert = sbert_wk
+        # print(self.sentences)
+        # sss
+        self.embeddings = self.sbert.get_doc_embeddings(self.sentences)
+
+    def similarity(self,embed_i, embed_j):
+        return embed_i.dot(embed_j) / np.linalg.norm(embed_i) / np.linalg.norm(embed_j)
+
+    def pair_encoding(self):
+        pairs = []
+        for i,sent_1 in enumerate(self.sentences):
+            for j,sent_2 in enumerate(self.sentences):
+                if sent_1 != sent_2:
+                    pair_len = len(sent_1) + len(sent_2) + 4
+                    input_ids = torch.zeros(1, self.max_len, dtype=torch.long)
+                    token_type_ids = torch.zeros(1, self.max_len, dtype=torch.long)
+                    attention_mask = torch.zeros(1, self.max_len, dtype=torch.long)
+                    token_type_ids[0][:pair_len] = torch.tensor([[0] * (len(sent_1)+2) + [1] * (len(sent_2)+2)]).unsqueeze(0)
+                    input_ids[0][:pair_len] = torch.tensor(self.tokenizer.convert_tokens_to_ids(['[CLS]'] + sent_1 + ['[SEP]'] + ['CLS'] + sent_2 + ['[SEP]'])).unsqueeze(0)
+                    attention_mask[0][:pair_len] = torch.ones([1] * pair_len)
+                    pair_encoding = self.encoder(input_ids, attention_mask, token_type_ids)[0]
+                    sent_1_embedding = pair_encoding[0, :len(sent_1)+2][0]
+                    sent_2_embedding = pair_encoding[0, len(sent_1)+2:len(sent_1)+len(sent_2)+4][0]
+                    similarity = F.cosine_similarity(sent_1_embedding, sent_2_embedding, dim=0)
+                    F.cosine_similarity(sent_1_embedding.unsqueeze(0), sent_2_embedding.unsqueeze(0), dim=0)
+                    pairs.append((i, j, similarity.item()))
+            else:
+                continue
+        return pairs
+    
+    def half_pair_encoding(self):
+        pairs_1_with_2 = []
+        pairs_2_with_1 = []
+        for i,sent_1 in enumerate(self.doc1_sentences):
+            for j,sent_2 in enumerate(self.doc2_sentences):
+                pair_len = len(sent_1) + len(sent_2) + 4
+                input_ids = torch.zeros(1, self.max_len, dtype=torch.long)
+                token_type_ids = torch.zeros(1, self.max_len, dtype=torch.long)
+                attention_mask = torch.zeros(1, self.max_len, dtype=torch.long)
+                token_type_ids[0][:pair_len] = torch.tensor([[0] * (len(sent_1)+2) + [1] * (len(sent_2)+2)]).unsqueeze(0)
+                input_ids[0][:pair_len] = torch.tensor(self.tokenizer.convert_tokens_to_ids(['[CLS]'] + sent_1 + ['[SEP]'] + ['CLS'] + sent_2 + ['[SEP]'])).unsqueeze(0)
+                attention_mask[0][:pair_len] = torch.ones([1] * pair_len)
+                pair_encoding = self.encoder(input_ids, attention_mask, token_type_ids)[0]
+                sent_1_embedding = pair_encoding[0, :len(sent_1)+2][0]
+                sent_2_embedding = pair_encoding[0, len(sent_1)+2:len(sent_1)+len(sent_2)+4][0]
+                similarity = F.cosine_similarity(sent_1_embedding, sent_2_embedding, dim=0)
+                F.cosine_similarity(sent_1_embedding.unsqueeze(0), sent_2_embedding.unsqueeze(0), dim=0)
+                pairs_1_with_2.append((i, j, similarity.item()))
+        for i,sent_1 in enumerate(self.doc2_sentences):
+            for j,sent_2 in enumerate(self.doc1_sentences):
+                pair_len = len(sent_1) + len(sent_2) + 4
+                input_ids = torch.zeros(1, self.max_len, dtype=torch.long)
+                token_type_ids = torch.zeros(1, self.max_len, dtype=torch.long)
+                attention_mask = torch.zeros(1, self.max_len, dtype=torch.long)
+                token_type_ids[0][:pair_len] = torch.tensor([[0] * (len(sent_1)+2) + [1] * (len(sent_2)+2)]).unsqueeze(0)
+                input_ids[0][:pair_len] = torch.tensor(self.tokenizer.convert_tokens_to_ids(['[CLS]'] + sent_1 + ['[SEP]'] + ['CLS'] + sent_2 + ['[SEP]'])).unsqueeze(0)
+                attention_mask[0][:pair_len] = torch.ones([1] * pair_len)
+                pair_encoding = self.encoder(input_ids, attention_mask, token_type_ids)[0]
+                sent_1_embedding = pair_encoding[0, :len(sent_1)+2][0]
+                sent_2_embedding = pair_encoding[0, len(sent_1)+2:len(sent_1)+len(sent_2)+4][0]
+                similarity = F.cosine_similarity(sent_1_embedding, sent_2_embedding, dim=0)
+                F.cosine_similarity(sent_1_embedding.unsqueeze(0), sent_2_embedding.unsqueeze(0), dim=0)
+                pairs_2_with_1.append((i, j, similarity.item()))        
+
+        return pairs_1_with_2, pairs_2_with_1
+
+    def sentence_ordering(self):
+        pairs = self.pair_encoding()
+        # start
+        Selected = []
+        pair_start = [p for p in pairs if p[0]==0].sort(reverse=True)[0]
+        Selected.append(pair_start[1])
+        pair_next = [p for p in pairs if p[0]==Selected[-1]].sort(reverse=True)[0]
+        score_max = 0
+        pdb.set_trace()
+        while(len(Selected)<=8):
+            pair_next = [p for p in pairs if p[0]==Selected[-1]].sort(reverse=True)[0]
+            score_max = 0
+            for p_n in pair_next:
+                if p_n[2] > score_max:
+                    score_max = p_n[2]
+                    candidate = p_n[1]
+                else:
                     continue
-                best.append((-1, 100000)) 
-                for j in range(i-1, -1, -1): 
-                    if p - poses[j][0] > BLOCK_SIZE: 
-                        break
-                    value = best[j][1] + cost + sen_cost
-                    if value < best[i][1]:
-                        best[i] = (j, value)
-                assert best[i][0] >= 0
-            intervals, x = [], len(poses) - 1 
-            while x > 0: 
-                l = poses[best[x][0]][0 ]
-                intervals.append((l + 1, poses[x][0] + 1))
-                x = best[x][0] 
-            if properties is None:
-                properties = []
-            for st, en in reversed(intervals):
-                # copy from hard version
-                cnt += 1
-                tmp = d[st: en] + [tokenizer.sep_token]
-                # inject properties into blks
-                tmp_kwargs = {}
-                for p in properties:
-                    if len(p) == 2:
-                        tmp_kwargs[p[0]] = p[1]
-                    elif len(p) == 3:
-                        if st <= p[1] < en:
-                            tmp_kwargs[p[0]] = (p[1] - st, p[2])
+            Selected.append(candidate)
+        return Selected
+
+
+    def half_ordering(self):
+        Insert_2_to_1 = []
+        Insert_1_to_2 = []
+        pairs_1_with_2, pairs_2_with_1 = self.half_pair_encoding()
+        doc1_num = len(self.doc1_sentences)
+        doc2_num = len(self.doc2_sentences)
+        Selected = []
+        for s_2_idx in range(doc2_num):
+            s_2_map = list((filter(lambda pair: pair[1] == s_2_idx, pairs_1_with_2)))
+            head_idx = sorted(s_2_map, key=lambda sims: sims[2], reverse=True)[0][0]
+            Insert_2_to_1.append((s_2_idx, '->', head_idx))
+        for s_1_idx in range(doc1_num):
+            s_1_map = list((filter(lambda pair: pair[1] == s_1_idx, pairs_2_with_1)))
+            head_idx = sorted(s_1_map, key=lambda sims: sims[2], reverse=True)[0][0]
+            Insert_1_to_2.append((s_1_idx, '->', head_idx))
+        to_be_removed_2_to_1 = []
+        to_be_removed_1_to_2 = []
+        for i_2_to_1 in Insert_2_to_1:
+            for i_1_to_2 in Insert_1_to_2:
+                if i_2_to_1[0]==i_1_to_2[2] and i_2_to_1[2]==i_1_to_2[0]: # symmetric
+                    Selected.append(self.doc1_sentences[i_2_to_1[2]])
+                    Selected.append(self.doc2_sentences[i_1_to_2[2]])
+                    to_be_removed_2_to_1.append(i_2_to_1)
+                    to_be_removed_1_to_2.append(i_1_to_2)
+
+        for tb_r_2_1 in to_be_removed_2_to_1:
+            Insert_2_to_1.remove(tb_r_2_1)
+        for tb_r_1_2 in to_be_removed_1_to_2:
+            Insert_1_to_2.remove(tb_r_1_2)
+        pdb.set_trace()
+        max_score = 0
+        chain = []
+        for rest_pair in Insert_1_to_2:
+            s_1_score = 0
+            s_1_idx = rest_pair[0]
+            s_1_map = list((filter(lambda pair: pair[0] == s_1_idx, pairs_1_with_2)))
+            for mp in s_1_map:
+                s_1_score += mp[2]
+            if s_1_score > max_score:
+                max_score = s_1_score
+                chain_start = s_1_idx
+        chain.append(chain_start)
+        return Selected
+
+    
+    def half_sbert_encoding(self):
+        pairs_1_with_2 = []
+        pairs_2_with_1 = []
+        for i, sent_prior in enumerate(self.doc1_sentences):
+            for j, sent_later in enumerate(self.doc2_sentences):
+                similarity = self.sbert.pair_sims(" ".join(sent_prior), " ".join(sent_later))
+                pairs_1_with_2.append((i, j, similarity.item()))
+        for i, sent_prior in enumerate(self.doc2_sentences):
+            for j, sent_later in enumerate(self.doc1_sentences):
+                similarity = self.sbert.pair_sims(" ".join(sent_prior), " ".join(sent_later))
+                pairs_2_with_1.append((i, j, similarity.item()))
+        return pairs_1_with_2, pairs_2_with_1        
+
+    def sbert_encoding(self):
+        pairs = []
+        sentences = self.doc1_sentences + self.doc2_sentences
+        for i, sent_prior in enumerate(sentences):
+            for j, sent_later in enumerate(sentences):
+                if i!=j:
+                    similarity = self.sbert.pair_sims(" ".join(sent_prior), " ".join(sent_later))
+                    pairs.append((i, j, similarity.item()))
+                    pairs.append((j, i, similarity.item()))
+        return pairs
+    
+    def peer_encoding(self, h_idx):
+        pairs = []
+        sentences = self.doc1_sentences + self.doc2_sentences
+        sent_prior = sentences[h_idx]
+        for j, sent_later in enumerate(sentences):
+            if j!=h_idx:
+                #similarity = self.sbert.pair_sims(" ".join(sent_prior), " ".join(sent_later))
+                similarity = self.similarity(self.embeddings[h_idx], self.embeddings[j])
+                #pairs.append((h_idx, j, similarity.item()))
+                pairs.append((h_idx, j, similarity))
+
+            else:
+                pairs.append((h_idx, j, 0))
+        return pairs
+                
+
+    def generate_edges(self):
+        Edge_2_to_1 = []
+        Edge_1_to_2 = []
+        pairs_1_with_2, pairs_2_with_1 = self.half_sbert_encoding()
+        doc1_num = len(self.doc1_sentences)
+        doc2_num = len(self.doc2_sentences)
+        for s_2_idx in range(doc2_num):
+            s_2_map = list((filter(lambda pair: pair[1] == s_2_idx, pairs_1_with_2)))
+            head_idx = sorted(s_2_map, key=lambda sims: sims[2], reverse=True)[0][0]
+            Edge_2_to_1.append((s_2_idx, '->', head_idx))
+        for s_1_idx in range(doc1_num):
+            s_1_map = list((filter(lambda pair: pair[1] == s_1_idx, pairs_2_with_1)))
+            head_idx = sorted(s_1_map, key=lambda sims: sims[2], reverse=True)[0][0]
+            Edge_1_to_2.append((s_1_idx, '->', head_idx))
+        return Edge_2_to_1, Edge_1_to_2
+
+    def topo_sort(self):
+        doc1_num = len(self.doc1_sentences)
+        doc2_num = len(self.doc2_sentences)
+        Edge_2_to_1, Edge_1_to_2 = self.generate_edges()
+        Edge_1_to_1 = [(i, '->', i+1) for i in range(doc1_num-1)]
+        Edge_2_to_2 = [(i, '->', i+1) for i in range(doc2_num-1)]
+        nvert = doc1_num + doc2_num
+        g = Graph(nvert)
+        for edge in Edge_2_to_1: 
+            pos_start = edge[2]
+            pos_end   = edge[0] + doc1_num
+            g.addEdge(pos_start, pos_end, 1)
+        for edge in Edge_1_to_2:
+            pos_start = edge[2] + doc1_num
+            pos_end = edge[0]
+            g.addEdge(pos_start, pos_end, 1) 
+        for edge in Edge_1_to_1: 
+            pos_s2 = edge[0] 
+            pos_s1 = edge[2]
+            g.addEdge(pos_s2, pos_s1, 1)
+        for edge in Edge_2_to_2:
+            pos_s1 = edge[0] + doc1_num
+            pos_s2 = edge[2] + doc1_num
+            g.addEdge(pos_s1, pos_s2, 1) 
+        while g.isCyclic():
+            g.isCyclic()
+        order = g.topologicalSort()
+        return order
+
+    def all_sort(self, starts, ends):
+        s_e_pairs = []
+        for start in starts:
+            for end in ends:
+                s_e_pairs.append((start, end))
+        pairs = self.sbert_encoding()
+        chains = []
+        
+        for s_e_pair in s_e_pairs:
+            start = s_e_pair[0]
+            end = s_e_pair[1]
+            chain = []
+            chain.append(start)
+            peers = list((filter(lambda pair: pair[0] == start and pair[1] not in chain, pairs)))
+            next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+            while next_blk != end:
+                chain.append(next_blk)
+                peers = list((filter(lambda pair: pair[0] == next_blk and pair[1] not in chain, pairs)))
+                next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+            chain.append(next_blk)
+            chains.append(chain)
+        return chains
+
+    def dynamic_sort(self, starts, ends):
+        s_e_pairs = []
+        for start in starts:
+            for end in ends:
+                s_e_pairs.append((start, end))
+        pairs = self.sbert_encoding()
+        chains = []
+        
+        for s_e_pair in s_e_pairs:
+            start = s_e_pair[0]
+            end = s_e_pair[1]
+            chain = []
+            chain.append(start)
+            pairs = self.peer_encoding(start)
+            #pdb.set_trace()
+            peers = list((filter(lambda pair: pair[0] == start and pair[1] not in chain, pairs)))
+            next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+            while next_blk != end:
+                chain.append(next_blk)
+                pairs = self.peer_encoding(next_blk)
+                peers = list((filter(lambda pair: pair[0] == next_blk and pair[1] not in chain, pairs)))
+                next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+            chain.append(next_blk)
+            if chain not in chains:
+                chains.append(chain)
+            else:
+                continue
+        return chains
+    
+    def semantic_based_sort(self, starts, ends):
+        # print("docs1", self.doc1_sentences[0])
+        # print("starts", starts)
+        # print("ends", ends)
+        start = random.choice(starts)
+        # print("start", starts)
+        chain = []
+        chain.append(start)
+        pairs = self.peer_encoding(start)
+        peers = list((filter(lambda pair: pair[0] == start and pair[1] not in chain, pairs)))
+        next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+        while next_blk not in ends:
+            chain.append(next_blk)
+            pairs = self.peer_encoding(next_blk)
+            peers = list((filter(lambda pair: pair[0] == next_blk and pair[1] not in chain, pairs)))
+            next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+        chain.append(next_blk)
+        rest = list(set([i for i in range(len(self.sentences))]) - set(chain))
+        random.shuffle(rest)
+        if len(chain) < 8:
+            chain.extend(rest[:8-len(chain)])
+        else:
+            pass
+        # print('chain', chain)
+        # sss
+        return [chain]
+
+
+    def unsemantic_based_sort(self, starts, ends):
+        start = random.choice(starts)
+        end = random.choice(ends)
+        
+        chain = []
+        chain.append(start)
+
+        sentences = self.doc1_sentences + self.doc2_sentences
+        s_ids = list(set([idx for idx,_ in enumerate(sentences)]).difference(set([start,end])))
+        random.shuffle(s_ids)
+        others = min(6, len(s_ids)-2)
+        chain.extend(s_ids[:others+1])
+        chain.append(end)
+        return [chain]
+
+    def bidirection_sort(self, starts, ends):
+        s_e_pairs = []
+        for start in starts:
+            for end in ends:
+                s_e_pairs.append((start, end))
+        chains = []
+        
+        for s_e_pair in s_e_pairs:
+            start = s_e_pair[0]
+            end = s_e_pair[1]
+            chain_head = []
+            chain_tail = []
+            chain_head.append(start)
+            chain_tail.append(end)
+
+            pairs_head = self.peer_encoding(start)
+            pairs_tail = self.peer_encoding(end)
+
+            peers_head = list((filter(lambda pair: pair[0] == start and pair[1] not in chain_head, pairs_head)))
+            next_blk_head = sorted(peers_head, key=lambda sims: sims[2], reverse=True)[0][1]
+            peers_tail = list((filter(lambda pair: pair[0] == end and pair[1] not in chain_tail, pairs_tail)))
+            next_blk_tail = sorted(peers_tail, key=lambda sims: sims[2], reverse=True)[0][1]
+            while next_blk_head != end and len(chain_head)<4:
+                chain_head.append(next_blk_head)
+                pairs_head = self.peer_encoding(next_blk_head)
+                peers_head = list((filter(lambda pair: pair[0] == next_blk_head and pair[1] not in chain_head, pairs_head)))
+                next_blk_head = sorted(peers_head, key=lambda sims: sims[2], reverse=True)[0][1]
+            while next_blk_tail != start and len(chain_tail)<4:
+                chain_tail.append(next_blk_tail)
+                pairs_tail = self.peer_encoding(next_blk_tail)
+                peers_tail = list((filter(lambda pair: pair[0] == next_blk_tail and pair[1] not in chain_tail, pairs_tail)))
+                next_blk_tail = sorted(peers_tail, key=lambda sims: sims[2], reverse=True)[0][1]
+            if next_blk_head==end or next_blk_tail==start:
+                if next_blk_head==end:
+                    chain_head.append(next_blk_head)
+                    chain = chain_head
+                if next_blk_tail==start:
+                    chain_tail.append(next_blk_tail)
+                    chain_tail.reverse()
+                    chain = chain_tail
+            else:
+                chain_tail.reverse()
+                chain = merge_chain(chain_head=chain_head, chain_tail=chain_tail)
+            chains.append(chain)
+        return chains
+
+    def threeSent(self, starts, ends, co_occur):
+        def consecutive_path(starts, ends):
+            chain = []
+            for start in starts:
+                chain.append(start)
+                pairs = self.peer_encoding(start)
+                peers = list((filter(lambda pair: pair[0] == start and pair[1] not in chain, pairs)))
+                next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+                while next_blk not in ends and len(chain)<=2:
+                    chain.append(next_blk)
+                    pairs = self.peer_encoding(next_blk)
+                    peers = list((filter(lambda pair: pair[0] == next_blk and pair[1] not in chain, pairs)))
+                    next_blk = sorted(peers, key=lambda sims: sims[2], reverse=True)[0][1]
+                chain.append(next_blk)
+                if len(set(chain).intersection(set(ends))) > 0 :
+                    break
+                else:
+                    chain = []
+                    continue
+            return chain
+        def multihop_path(starts, ends, co_occur):
+            ori_co_occur = [i for i in co_occur]
+            path = []
+            edges_tuple = []
+            start_pos = {}
+            end_pos = {}
+            start_edges = list((filter(lambda co: co[0]==1 and co[2] in starts, co_occur)))
+            end_edges = list((filter(lambda co: co[0]==2 and co[2] in ends, co_occur)))
+            for s_ed in start_edges:
+                start_pos[s_ed[2]]=s_ed[1]
+                edges_tuple.append((1, s_ed[1]))
+            for e_ed in end_edges:
+                end_pos[e_ed[2]]=e_ed[1]
+                edges_tuple.append((2, e_ed[1]))
+            co_occur = list(set(co_occur).difference(set(start_edges)).difference(set(end_edges)))
+            if len(start_edges)>0 and len(end_edges)>0:
+                next_set = []
+                pre_set = []
+                next_pos = {}
+                pre_pos = {}
+                for s_ed in start_edges:
+                    next_set.append(s_ed[1])
+                    next_pos[s_ed[2]]=s_ed[1]
+                    edges_tuple.append((s_ed[0], s_ed[1]))
+                next_set = set(next_set)
+                for e_ed in end_edges:
+                    pre_set.append(e_ed[1])
+                    pre_pos[e_ed[2]]=e_ed[1]
+                    edges_tuple.append((e_ed[0], e_ed[1]))
+                pre_set = set(pre_set)
+            while(len(next_set.intersection(pre_set))==0 and len(co_occur)>0):
+                start_edges = list((filter(lambda co: co[0] in list(next_set), co_occur)))
+                end_edges = list((filter(lambda co: co[0] in list(pre_set), co_occur)))
+                co_occur = list(set(co_occur).difference(set(start_edges)).difference(set(end_edges)))
+                next_set = list(next_set)
+                pre_set = list(pre_set)
+                for s_ed in start_edges:
+                    next_set.append(s_ed[1])
+                    next_pos[s_ed[2]]=s_ed[1]
+                    edges_tuple.append((s_ed[0], s_ed[1]))
+                next_set = set(next_set)
+                for e_ed in end_edges:
+                    pre_set.append(e_ed[1])
+                    pre_pos[e_ed[2]]=e_ed[1]
+                    edges_tuple.append((e_ed[0], e_ed[1]))
+                pre_set = set(pre_set)
+            entity_chain = merge_chain(list(next_set)+[1], [2]+list(pre_set))
+            print(entity_chain)
+            edges_tuple = list(set(edges_tuple))
+            path_edges = list((filter(lambda co: co[0] in entity_chain and co[1] in entity_chain, edges_tuple)))
+            path_triplet = list((filter(lambda e: (e[0], e[1]) in path_edges, ori_co_occur)))
+            path = [o[2] for o in path_triplet]
+            return path
+
+        def default_path(starts, ends, co_occur, max_pos):
+            chain = starts + ends
+            if len(chain) >= 8:
+                chain = [starts[0]] + [ends[0]] + random.choices(list(set(starts+ends).difference(set([starts[0]] + [ends[0]]))), k=6)
+            else:
+                while(len(chain)<=7):
+                    offset = [-3,-2,-1,1,2,3]
+                    ex_blk = random.choices(chain,k=1)[0] + random.choices(offset, k=1)[0]
+                    if 0<=ex_blk<=max_pos-1 and ex_blk not in chain:
+                        chain.append(ex_blk)
                     else:
-                        raise ValueError('Invalid property {}'.format(p))
-                ret.insert(Block(tokenizer.convert_tokens_to_ids(tmp), cnt, **tmp_kwargs))
-        for blk in ret.blocks:
-            blk.docid = docid
-        return ret, cnt 
+                        continue
+            return chain
 
-    def __init__(self):
-        self.blocks = []
-
-    def __add__(self, buf):
-        ret = Buffer()
-        ret.blocks = self.blocks + buf.blocks
-        return ret
-
-    def __len__(self):
-        return len(self.blocks)
-    
-    def __getitem__(self, key):
-        return self.blocks[key]
-
-    def __str__(self):
-        return ''.join([str(b)+'\n' for b in self.blocks])
-        
-    def clone(self):
-        ret = Buffer()
-        ret.blocks = self.blocks.copy()
-        return ret
-
-    def calc_size(self):
-        return sum([len(b) for b in self.blocks])
-
-    def block_ends(self):
-        t, ret = 0, []
-        for b in self.blocks:
-            t += len(b)
-            ret.append(t)
-        return ret
-
-    def insert(self, b, reverse=True):
-        if not reverse:
-            for index in range(len(self.blocks) + 1):
-                if index >= len(self.blocks) or b < self.blocks[index]:
-                    self.blocks.insert(index, b)
-                    break
+        c_path = consecutive_path(starts, ends)
+        s_e, e_e = multihop_path(starts, ends, co_occur)
+        d_path = default_path(starts, ends, co_occur, len(self.sentences))
+        if len(c_path)>0:
+            path = c_path
+        elif len(d_path)>0:
+            path = d_path
         else:
-            for index in range(len(self.blocks), -1, -1):
-                if index == 0 or self.blocks[index - 1] < b:
-                    self.blocks.insert(index, b)
-                    break
+            path = []
+        print(path)
+        return [path]
 
-    def merge(self, buf):
-        ret = Buffer()
-        t1, t2 = 0, 0
-        while t1 < len(self.blocks) or t2 < len(buf):
-            if t1 < len(self.blocks) and (t2 >= len(buf) or self.blocks[t1] < buf.blocks[t2]):
-                ret.blocks.append(self.blocks[t1])
-                t1 += 1
-            else:
-                ret.blocks.append(buf.blocks[t2])
-                t2 += 1
-        return ret
-    
-    def filtered(self, fltr: 'function blk, index->bool', need_residue=False):
-        ret, ret2 = Buffer(), Buffer()
-        for i, blk in enumerate(self.blocks):
-            if fltr(blk, i):
-                ret.blocks.append(blk)
-            else:
-                ret2.blocks.append(blk)
-        if need_residue:
-            return ret, ret2
-        else:
-            return ret
-            
-    def random_sample(self, size):
-        assert size <= len(self.blocks)
-        index = sorted(random.sample(range(len(self.blocks)), size))
-        ret = Buffer()
-        ret.blocks = [self.blocks[i] for i in index]
-        return ret
-    
-    def sort_(self):
-        self.blocks.sort()
-        return self
-
-    def fill(self, buf):
-        ret, tmp_buf, tmp_size = [], self.clone(), self.calc_size()
-        for blk in buf:
-            if tmp_size + len(blk) > CAPACITY:
-                ret.append(tmp_buf)
-                tmp_buf, tmp_size = self.clone(), self.calc_size()
-            tmp_buf.blocks.append(blk)
-            tmp_size += len(blk)
-        ret.append(tmp_buf)
-        return ret
-
-    def export(self, device=None, length=None, out=None):
-        if out is None:
-            if length is None:
-                total_length = self.calc_size()
-                if total_length > CAPACITY:
-                    raise ValueError('export inputs larger than capacity')
-            else:
-                total_length = length * len(self.blocks)
-            ids, att_masks, type_ids = torch.zeros(3, total_length, dtype=torch.long, device=device)
-        else: # must be zeros and big enough
-            ids, att_masks, type_ids = out
-            att_masks.zero_()
-        t = 0
-        for b in self.blocks:
-            try:
-                ids[t:t + len(b)] = torch.tensor(b.ids, dtype=torch.long, device=device)
-            except:
-                #pdb.set_trace()
-                ids[t-1 :t-1 + len(b)] = torch.tensor(b.ids, dtype=torch.long, device=device) 
-                #pdb.set_trace()
-            # if b.blk_type == 1:
-            #     type_ids[t:w] = 1 # sentence B
-            att_masks[t:t + len(b)] = 1 # attention_mask
-            t += len(b) if length is None else length
-        return ids, att_masks, type_ids
-    
-    def export_01_turn(self, device=None, length=None, out=None):
-        if out is None:
-            if length is None:
-                total_length = self.calc_size()
-                if total_length > CAPACITY:
-                    raise ValueError('export inputs larger than capacity')
-            else:
-                total_length = length * len(self.blocks)
-            ids, att_masks, type_ids = torch.zeros(3, total_length, dtype=torch.long, device=device)
-        else: # must be zeros and big enough
-            ids, att_masks, type_ids = out
-            att_masks.zero_()
-        t = 0
-        # print("self.blocks", self.blocks)
-        # sss
-        #print("len_blocks", len(self.blocks))
-        for bidx, b in enumerate(self.blocks):
-            #print("bidx", bidx)
-            if t>=512:
-                break
-            try:
-                ids[t:t + len(b)] = torch.tensor(b.ids, dtype=torch.long, device=device) # id
-
-            except:
-                #pdb.set_trace()
-                print("capacity:", 512 - t, "blk_length:", len(b))
-                try:
-                    ids[t-1 :t-1 + len(b)] = torch.tensor(b.ids, dtype=torch.long, device=device)
-
-                except: 
-                    
-                    print(ids, len(ids))
-                    print(b.ids, len(b.ids))
-                    print("t_try", t)
-                    try:
-                        ids[t : -1] = torch.tensor(b.ids, dtype=torch.long, device=device)[:512 - t - 1]
-                        ids[-1] = torch.tensor([102], dtype=torch.long, device=device)
-
-                    except Exception as e:
-                        print(e)
-                        pdb.set_trace()
-                #pdb.set_trace()
-            # if b.blk_type == 1:
-            #     type_ids, [t:w] = 1 # sentence B
-            # print("t", t)
-            att_masks[t:t + len(b)] = 1  # attention_mask
-            t += len(b) if length is None else length
-        #sss
-        sentences = []
-        sentences_with_sep = []
-        ptr = 0
-        ids_list = ids.tolist()
-        for i in range(len(ids_list)):
-            if ids_list[i] == 102:
-                sentences.append(ids_list[ptr:i])
-                sentences_with_sep.append(ids_list[ptr:i+1])
-                #print("sentences",ids_list[ptr:i])
-                #print("sentences_with_sep",ids_list[ptr:i+1])
-                ptr = i+1
-        sentences[-1].append(102)
-        ###获得句子对应的文档id
-        tmp_docs = []
-        for sens in sentences_with_sep:
-            for b in self.blocks:
-                if sens == b.ids:
-                    tmp_docs.append(b.docid)
-                    break
-        # print("sentences",sentences)
-        # sss
-        s_ptr = 0
-        for s_idx in range(len(sentences_with_sep)):
-            type_ids[s_ptr:s_ptr + len(sentences_with_sep[s_idx])] = torch.tensor([s_idx%2]* len(sentences_with_sep[s_idx]), dtype=torch.long, device=device)
-            s_ptr += len(sentences_with_sep[s_idx])
-        return ids, att_masks, type_ids, tmp_docs
-
-    def export_01_doc(self, device=None, length=None, out=None):
-        if out is None:
-            if length is None:
-                total_length = self.calc_size()
-                if total_length > CAPACITY:
-                    raise ValueError('export inputs larger than capacity')
-            else:
-                total_length = length * len(self.blocks)
-            ids, att_masks, type_ids = torch.zeros(3, total_length, dtype=torch.long, device=device)
-        else: # must be zeros and big enough
-            ids, att_masks, type_ids = out
-            att_masks.zero_()
-        t = 0
-        
+def merge_chain(chain_head, chain_tail):
+    overlap_blk = list(set(chain_head).intersection(set(chain_tail)))
+    if len(overlap_blk) >= 1:
         #pdb.set_trace()
-        doc0_ids = []
-        doc1_ids = []
-        for b in self.blocks:
-            if b.docid == 0:
-                doc0_ids.extend(b.ids)
-            elif b.docid == 1:
-                doc1_ids.extend(b.ids)
-        #pdb.set_trace()
-        ids[:len(doc0_ids)] = torch.tensor(doc0_ids, dtype=torch.long, device=device)
-        try:        
-            ids[len(doc0_ids):len(doc0_ids)+len(doc1_ids)] = torch.tensor(doc1_ids, dtype=torch.long, device=device)
-        except:
-            pdb.set_trace()
-            print(doc1_ids)
-            doc1_ids.reverse()
-            doc1_ids.remove(102)
-            doc1_ids.remove(102)
-            doc1_ids.reverse()
-            doc1_ids.append(102) 
-            ids[len(doc0_ids):len(doc0_ids)+len(doc1_ids)] = torch.tensor(doc1_ids, dtype=torch.long, device=device)
-        type_ids[:len(doc0_ids)] = torch.tensor([0]*len(doc0_ids), dtype=torch.long, device=device)
-        type_ids[len(doc0_ids):len(doc0_ids)+len(doc1_ids)] = torch.tensor([1]*len(doc1_ids), dtype=torch.long, device=device)
-        return ids, att_masks, type_ids
-
-    def export_as_batch(self, device, length=BLOCK_SIZE+1, add_cls=False):
-        ids, att_masks, type_ids = self.export(device, length, add_cls=add_cls)
-        return ids.view(-1, length), att_masks.view(-1, length), type_ids.view(-1, length)
-
-    def export_relevance(self, device, length=None, dtype=torch.long, out=None):
-        if out is None:
-            total_length = self.calc_size() if length is None else length * len(self.blocks)
-            relevance = torch.zeros(total_length, dtype=dtype, device=device)
-        else:
-            relevance = out
-        t = 0
-        for b in self.blocks:
-            w = t + (len(b) if length is None else length)
-            if b.relevance >= 1:
-                relevance[t: w] = 1
-            t = w
-        return relevance
-
-def buffer_collate(batch): 
-    return batch
+        print(overlap_blk)
+    for ov in overlap_blk:
+        chain_tail.remove(ov)
+    merged = chain_head + chain_tail
+    return merged
