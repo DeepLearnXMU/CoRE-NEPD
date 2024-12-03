@@ -15,7 +15,8 @@ Follow the guideliens from : https://github.com/thunlp/CodRED
 `ours/main.py`: File for training/validate
 ## Dataset
 All of the dataset files are in ```./dataset/```
-please add dsre_train_example.json (https://drive.google.com/file/d/1_E0V6ljMu-J6s3O7AUmdRdxhKBFTlJBv/view?usp=sharing) to ```./dataset/```
+
+please add [dsre_train_example.json] (https://drive.google.com/file/d/1_E0V6ljMu-J6s3O7AUmdRdxhKBFTlJBv/view?usp=sharing) to ```./dataset/```
 
 Note that we also provide the dataset for open setting in ```./dataset/open_setting_data/```, following https://github.com/luka-group/MrCoD
 
