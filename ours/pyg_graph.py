@@ -201,4 +201,4 @@ if __name__ == "__main__":
     g = create_graph(r_nodes, r_embs, p_embs, b_embs)
     print(g)
     model = GCN(hidden_channels=64, dim_node_features=128, num_classes=10)
-    print(model)s
+    print(model)
