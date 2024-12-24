@@ -2695,7 +2695,7 @@ class CodredCallback(TrainerCallback):
         d = list()
         for i in range(len(self.dsre_train_dataset) // 8):
             d.append(self.dsre_train_dataset[8 * i:8 * i + 8])
-        d = random.sample(d, len(train_bags))
+
         if self.args.raw_only:
             pass
         elif self.args.dsre_only:
